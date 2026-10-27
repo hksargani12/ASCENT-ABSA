@@ -1,5 +1,5 @@
 """Utility functions and auxiliary loss modules for ASCENT framework."""
-
+import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -101,35 +101,39 @@ class LabelSmoothLoss(nn.Module):
         return loss
 
 
-def mask_gradients(model, selected_neurons):
-    """
-    Zeroes out gradients for all neurons except the selected ones.
+_FFN_IN = re.compile(r"encoder\.layer\.(\d+)\.intermediate\.dense\.(weight|bias)$")
+_FFN_OUT = re.compile(r"encoder\.layer\.(\d+)\.output\.dense\.weight$")
 
-    Args:
-        model: BERT model instance
-        selected_neurons: dict mapping {layer_idx: [neuron_indices]}
-    """
-    for name, param in model.named_parameters():
-        if "encoder.layer" in name and "attention.self.query" in name:
-            layer_idx = int(name.split("encoder.layer.")[1].split(".")[0])
 
-            if str(layer_idx) in selected_neurons:
-                fine_tune_neurons = selected_neurons[str(layer_idx)]
-                if param.grad is not None:
-                    grad = param.grad
+def build_neuron_masks(model, selected_neurons, train_prefixes=()):
+    """Freeze everything except the selected FFN units and return {param: 0/1 mask}."""
+    masks = {}
+    for name, p in model.named_parameters():
+        m_in, m_out = _FFN_IN.search(name), _FFN_OUT.search(name)
+        m = m_in or m_out
+        idx = selected_neurons.get(m.group(1)) if m else None
 
-                    if grad.dim() == 2:
-                        mask = torch.zeros_like(grad)
-                        for idx in fine_tune_neurons:
-                            mask[:, idx] = 1.0
-                        param.grad *= mask
-                    elif grad.dim() == 1:
-                        mask = torch.zeros_like(grad)
-                        for idx in fine_tune_neurons:
-                            mask[idx] = 1.0
-                        param.grad *= mask
-                    else:
-                        #print(f"Skipping {name}: unexpected gradient shape {grad.shape}.")
-            else:
-                if param.grad is not None:
-                    param.grad.zero_()
+        if not idx:
+            # train_prefixes keeps the task head trainable when it is not part of the FFN
+            p.requires_grad = any(name.startswith(k) for k in train_prefixes)
+            continue
+
+        idx = torch.as_tensor(idx, dtype=torch.long, device=p.device)
+        dim = p.shape[1] if m_out else p.shape[0]
+        assert int(idx.max()) < dim, f"{name}: neuron index {int(idx.max())} out of range ({dim})"
+
+        mask = torch.zeros_like(p)
+        if m_out:
+            mask[:, idx] = 1.0  # outgoing weights of unit u (columns of W2)
+        else:
+            mask[idx] = 1.0     # incoming weights and bias of unit u (rows of W1)
+        p.requires_grad = True
+        masks[p] = mask
+    return masks
+
+
+def apply_masks(masks):
+    """Zero the gradient of every non-selected entry before the optimizer step."""
+    for p, mask in masks.items():
+        if p.grad is not None:
+            p.grad.mul_(mask)
